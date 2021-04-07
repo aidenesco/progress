@@ -58,6 +58,7 @@ func (w *Window) tick() {
 		case <-ticker.C:
 			w.move()
 		case <-w.end:
+			ticker.Stop()
 			return
 		}
 	}
@@ -85,8 +86,6 @@ func (w *Window) currentAverage() int64 {
 	var total int64
 	var num int64
 
-	w.mu.Lock()
-
 	for _, v := range w.data {
 		if v == -1 {
 			continue
@@ -94,8 +93,6 @@ func (w *Window) currentAverage() int64 {
 		total += v
 		num++
 	}
-
-	w.mu.Unlock()
 
 	if num == 0 {
 		num = 1
