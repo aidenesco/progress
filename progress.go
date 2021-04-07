@@ -95,6 +95,8 @@ func (w *Window) currentAverage() int64 {
 		num++
 	}
 
+	w.mu.Unlock()
+
 	if num == 0 {
 		num = 1
 	}
