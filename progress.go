@@ -1,24 +1,27 @@
-//Package progress calculates item processing speed over a double sliding window
+//Package progress calculates an average item processing speed over a double sliding window
 package progress
 
 import (
+	"context"
 	"errors"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 type Window struct {
-	mu         sync.RWMutex
+	sem        *semaphore.Weighted
 	total      time.Duration
 	interval   time.Duration
+	average    int64
 	current    int64
 	data       []int64
 	historical []int64
 	pos        int
-	end        chan struct{}
+	cancel     context.CancelFunc
 }
 
-//NewWindow returns a double sliding Window that can help you calculate item processing speed
+//NewWindow returns a double sliding Window that calculates an average item processing speed
 func NewWindow(total, interval time.Duration) (*Window, error) {
 	if total == 0 {
 		return nil, errors.New("progress: total cannot be 0")
@@ -30,12 +33,15 @@ func NewWindow(total, interval time.Duration) (*Window, error) {
 		return nil, errors.New("progress: total has to be a multiplier of interval")
 	}
 
+	cctx, cancel := context.WithCancel(context.Background())
+
 	w := &Window{
 		total:      total,
 		interval:   interval,
 		data:       make([]int64, int(total/interval)),
 		historical: make([]int64, int(total/interval)),
-		end:        make(chan struct{}, 1),
+		cancel:     cancel,
+		sem:        semaphore.NewWeighted(1),
 	}
 
 	for i := range w.data {
@@ -45,46 +51,32 @@ func NewWindow(total, interval time.Duration) (*Window, error) {
 		w.historical[i] = -1
 	}
 
-	go w.tick()
+	go w.tick(cctx)
 
 	return w, nil
 }
 
-func (w *Window) tick() {
+func (w *Window) tick(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 
 	for {
 		select {
 		case <-ticker.C:
-			w.move()
-		case <-w.end:
+			w.move(ctx)
+		case <-ctx.Done():
 			ticker.Stop()
 			return
 		}
 	}
 }
 
-func (w *Window) move() {
-	w.mu.Lock()
+func (w *Window) move(ctx context.Context) {
+	w.sem.Acquire(ctx, 1)
 
-	w.data[w.pos] = w.current
-
-	w.historical[w.pos] = w.currentAverage()
-
-	w.pos++
-
-	if w.pos >= len(w.data) {
-		w.pos = 0
-	}
-
-	w.current = 0
-
-	w.mu.Unlock()
-}
-
-func (w *Window) currentAverage() int64 {
 	var total int64
 	var num int64
+
+	w.data[w.pos] = w.current
 
 	for _, v := range w.data {
 		if v == -1 {
@@ -98,24 +90,12 @@ func (w *Window) currentAverage() int64 {
 		num = 1
 	}
 
-	return total / num
-}
+	firstAverage := total / num
 
-//ItemCompleted adds an item to the Window
-func (w *Window) ItemCompleted() {
-	w.mu.Lock()
+	w.historical[w.pos] = firstAverage
 
-	w.current += 1
-
-	w.mu.Unlock()
-}
-
-//Average gives you the average amount of items processed in the window, averaged over another sliding window
-func (w *Window) Average() int64 {
-	var total int64
-	var num int64
-
-	w.mu.Lock()
+	total = 0
+	num = 0
 
 	for _, v := range w.historical {
 		if v == -1 {
@@ -125,22 +105,40 @@ func (w *Window) Average() int64 {
 		num++
 	}
 
-	w.mu.Unlock()
-
 	if num == 0 {
 		num = 1
 	}
 
-	average := total / num
+	secondAverage := total / num
 
-	return average * int64(len(w.historical))
+	w.average = secondAverage * int64(len(w.historical))
+
+	w.pos++
+
+	if w.pos >= len(w.historical) {
+		w.pos = 0
+	}
+
+	w.current = 0
+
+	w.sem.Release(1)
+}
+
+//ItemCompleted adds a completed item to the Window
+func (w *Window) ItemCompleted() {
+	w.sem.Acquire(context.Background(), 1)
+
+	w.current += 1
+
+	w.sem.Release(1)
+}
+
+//Average gives you average item processing speed averaged over a double sliding Window
+func (w *Window) Average() int64 {
+	return w.average
 }
 
 //End stops the Window's ticking
 func (w *Window) End() {
-	select {
-	case w.end <- struct{}{}:
-	default:
-		return
-	}
+	w.cancel()
 }
